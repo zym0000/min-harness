@@ -9,7 +9,7 @@ class EventType(Enum):
     TASK_CANCELLED = auto()
     TASK_FAILED = auto()
 
-    THINKNING_STARTED = auto()
+    THINKING_STARTED = auto()
     THINKING_COMPLETED = auto()
     TOOL_CALL_PARSED = auto()
     TOOL_VALIDATION_PASSED = auto()
@@ -32,6 +32,8 @@ class EventType(Enum):
 
     NEED_USER_INPUT = auto()
     NEED_APPROVAL = auto()
+    APPROVAL_GRANTED = auto()
+    APPROVAL_DENIED = auto()
     PROGRESS_UPDATE = auto()
     FINAL_ANSWER = auto()
 
