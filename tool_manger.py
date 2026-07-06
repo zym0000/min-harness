@@ -5,24 +5,26 @@ from typing import Any, Dict,Optional,List
 from tool_execute_process.error_classify import ToolErrorType
 
 class ToolParameter:
-    def __init__(self, name, type, description, requied = False):
+    def __init__(self, name, type, description, required = False):
         self.name = name
         self.type = type
         self.description = description
-        self.requied = requied #参数是否是必须的
+        self.required = required #参数是否是必须的
 
     def to_dict(self):
         return {
             "name":self.name,
             "type":self.type,
             "description":self.description,
-            "requied":self.requied
+            "required":self.required
         }
 
 class Tool:
     def __init__(self,name,
-            description,func,
-            parameters,tags,
+            description,
+            parameters,
+            func,
+            tags,
             dangerous = False,
             executor_type:str  = "async"):
         
@@ -55,8 +57,8 @@ class Tool:
         parameter_doc = []
 
         for p in self.parameters:
-            req = "requied" if p.requied else "optional"
-            parameter_doc.append(f" - {p.name} ({p.type}, req): {p.description}")
+            req = "required" if p.required else "optional"
+            parameter_doc.append(f" - {p.name} ({p.type}, {req}): {p.description}")
         
         parameter_block = "\n".join(parameter_doc) if parameter_doc else "  parameterless"
 
@@ -70,12 +72,12 @@ class Tool:
     #     "parameters":{
     #         "type":"object",
     #         "properties":properties,
-    #         "requied":requied
+    #         "required":required
     #     }
     # }
     #这里是以open ai 样式进行写的 tool_call，可以增加接口，实现自己模型相关方式
     def to_openai_schema(self):
-        requied = []
+        required = []
         properties ={}
         for p in self.parameters:
             properties[p.name] = {
@@ -83,8 +85,8 @@ class Tool:
                 "description":p.description
             }
 
-            if p.requied:
-                requied.append(p.name)
+            if p.required:
+                required.append(p.name)
 
         return{
             "type":"function",
@@ -94,18 +96,18 @@ class Tool:
                 "parameters":{
                     "type":"object",
                     "properties":properties,
-                    "requied":requied
+                    "required":required
                 }
             }
         }
     
-    def execute(self, **kwargs):
+    async def execute(self, **kwargs):
         for param in self.parameters:
             param_dict = param.to_dict()
-            if param_dict.get('requied') and param_dict.get("name") not in kwargs:
+            if param_dict.get('required') and param_dict.get("name") not in kwargs:
                 raise ValueError(f"缺少必要参数 {param_dict.get("name")}")
         
-        return self.func(**kwargs)
+        return await self.func(**kwargs)
 
 @dataclass
 class ToolCall:
@@ -127,6 +129,7 @@ class ToolCallParser:
         thought_match = re.search(
             r"Thought:\s*(.+?)(?=\nAction:|$)", text, re.DOTALL | re.IGNORECASE
         )
+
         if thought_match:
             thought = thought_match.group(1).strip()
 
@@ -269,8 +272,8 @@ class ToolRegistry:
         
         for param in tool.parameters:
             param_dict = param.to_dict()
-            if param_dict.get("requied") and param_dict.get("name") not in call.arguments:
-                return f"missing requied parame:{param_dict.get("name")}"
+            if param_dict.get("required") and param_dict.get("name") not in call.arguments:
+                return f"missing required parame:{param_dict.get("name")}"
         return None
     
     def describe_tools(self, tools: Optional[List[Tool]] = None) -> str:
