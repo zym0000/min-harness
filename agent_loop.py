@@ -1,15 +1,14 @@
 from dataclasses import dataclass
 from enum import auto
-from typing import Optional,List,Dict
+from typing import Optional,List
 from tool_manger import ToolCall,ToolResult,ToolRegistry,ToolCallParser,Tool
 from llm_client import LLMClient
-from datetime import datetime
 from tool_execute_process.retry_engine import RetryEngine
-from tool_execute_process.tool_metrics import MetricsControll
 from tool_execute_process.error_classify import LLMErrorClassify
-from task.task_manager import TaskManager,TaskStatus
+from task.task_manager import TaskManager,TaskStatus,ContextManager
 from async_execution_engine import AsyncExecutionEngine
 from event.event import LoopEvent,EventType
+from approval_gate import ApprovalGate
 
 import time
 import asyncio
@@ -51,14 +50,16 @@ class RunResult:
     total_cost_estimate:float = 0.0
 
 class AgentLoop:
-    def __init__(self, tool_registry:ToolRegistry, 
+    def __init__(self, 
+                 tool_registry:ToolRegistry, 
                  llm:LLMClient, 
                  task_manager: TaskManager,
                  execution_engine:AsyncExecutionEngine,
+                 context_manager:ContextManager,
+                 approval:ApprovalGate,
                  cancel_event: asyncio.Event,
                  max_steps = 10,
                  retry_engine:Optional[RetryEngine] = None):
-        
         self.tool_registry = tool_registry
         self.llm = llm
         self.cancel_event = cancel_event
@@ -67,66 +68,71 @@ class AgentLoop:
         self.retry_engine = RetryEngine(retry_engine)
         self.execute_engine = execution_engine
         self.task_manager = task_manager
+        self.context_manager = context_manager
+        self.approval = approval
 
     async def _check_cancelled(self):
         if self.cancel_event.is_set():
             raise asyncio.CancelledError()
 
-    async def run(self,task_id,user_input:str,tools:List[Tool]):
-        final_status = TaskStatus.FAILED
-
+    async def run(self,task_id,tools:List[Tool]):
         await self.task_manager.update_state(
             task_id,
-            status=TaskStatus.RUNNING,
-            current_step=0,
-            messages=[
-                {"role": "user", "content": user_input},
-            ],
+            status=TaskStatus.RUNNING
         )
 
         yield LoopEvent(
             event_type= EventType.TASK_STARTED,
             task_id=task_id,
             timestamp= time.time(),
-            content=user_input,
         )
 
         try:
             async for event in self._execute_steps(task_id,tools):
                 yield event
         except asyncio.CancelledError:
-            final_status = TaskStatus.CANCELLED
             yield LoopEvent(
                 event_type=EventType.TASK_CANCELLED,
                 task_id=task_id,
                 timestamp=time.time()
             )
         except Exception as e:
-            final_status = TaskStatus.FAILED
+            print(f"e:{e}")
             yield LoopEvent(
                 event_type= EventType.TASK_FAILED,
                 task_id= task_id,
                 timestamp=time.time(),
                 content = str(e)
             )
+            await self.task_manager.update_state(task_id, status=TaskStatus.FAILED)
             raise
         finally:
             #保证UI或上层突然中断，可以正确完成
             state = await self.task_manager.get_state(task_id)
-            if state is not None and state.task_status == TaskStatus.RUNNING and final_status is not None:
-                await self.task_manager.update_state(task_id=task_id,status = final_status)
+            if state is not None and state.task_status == TaskStatus.RUNNING:
+                await self.task_manager.update_state(task_id=task_id,status = TaskStatus.FAILED)
     
     async def _execute_steps(self,task_id,tools:List[Tool]):
         for step_num in range(1,self.max_step+ 1):
             await self.task_manager.update_state(task_id=task_id,current_step = step_num)
             await self._check_cancelled()
 
-            state = await self.task_manager.get_state(task_id)
+            pending = await self.task_manager.drain_pending_input(task_id)
+            for user_input in pending:
+                await self.task_manager.append_msg(task_id,[
+                    {"role":"user","content":user_input}
+                ])
 
-            messages = list(state.messages) if state else []
+            messages = await self.task_manager.compress_messages(task_id,self.llm,self.context_manager)
+
+            state = await self.task_manager.get_state(task_id)
+            tokens_used = self.context_manager.token_estimate.estimate_message(messages)
+            await self.task_manager.update_state(
+                task_id, total_tokens_used=state.total_tokens_used + tokens_used
+            )
 
             yield LoopEvent(
-                event_type=EventType.THINKNING_STARTED,
+                event_type=EventType.THINKING_STARTED,
                 task_id=task_id,
                 timestamp= time.time(),
                 step_num=step_num
@@ -134,7 +140,7 @@ class AgentLoop:
 
             tool_schema  = self.tool_registry.to_openai_sechme(tools)
             llm_start_time = time.time()
-            llm_output = self.llm.chat(messages,tool_schema)
+            llm_output = await self.llm.chat(messages,tool_schema)
             llm_latency = (time.time()-llm_start_time)*1000
 
             yield LoopEvent(
@@ -143,7 +149,7 @@ class AgentLoop:
                 timestamp=time.time(),
                 step_num=step_num,
                 content=llm_output,
-                data={"llm_latency_ms": round(llm_latency, 2)},
+                data={"latency_ms": round(llm_latency, 2)},
             )
 
             tool_call, parse_error= self.parser.parse(llm_output)
@@ -156,14 +162,13 @@ class AgentLoop:
                     content=parse_error
                 )
 
-                new_message = messages + [
+                new_message = [
                     {"role":"assistant","content":llm_output},
-                    {"role":"user","content":f"Observation [Parse Error]:{parse_error}"}
+                    {"role":"user","content":f"[Parse Error]:{parse_error}"}
                 ]
 
-                await self.task_manager.update_state(task_id=task_id,messages=new_message)
+                await self.task_manager.append_msg(task_id=task_id,messages=new_message)
                 continue
-
             if tool_call is None:
                 yield LoopEvent(
                     event_type=EventType.FINAL_ANSWER,
@@ -180,6 +185,11 @@ class AgentLoop:
                 )
 
                 await self.task_manager.update_state(task_id,task_status=TaskStatus.COMPLETED)
+                await self.task_manager.append_msg(task_id,[{
+                    "role":"assistant",
+                    "content":llm_output,
+                }])
+
                 return
             
             yield LoopEvent(
@@ -200,15 +210,16 @@ class AgentLoop:
                     task_id = task_id,
                     timestamp=time.time(),
                     step_num=step_num,
-                    content=validate_error
+                     tool_name=tool_call.tool_name,
+                    content=validate_error,
                 )
 
-                new_message = messages + [
+                new_message = [
                     {"role":"assistant","content":llm_output},
                     {"role":"user","content":f"Observation [Tool Error]: {validate_error}"}
                 ]
 
-                await self.task_manager.update_state(task_id,messages=new_message)
+                await self.task_manager.append_msg(task_id,messages=new_message)
 
                 continue
 
@@ -221,7 +232,44 @@ class AgentLoop:
             )
 
             tool = self.tool_registry.get(tool_call.tool_name)
+            if tool.dangerous:
+                 await self.task_manager.update_state(task_id, status=TaskStatus.PAUSED)
 
+                 yield LoopEvent(
+                     event_type=EventType.NEED_APPROVAL,
+                     task_id=task_id,
+                     tool_name=tool.name,
+                     timestamp=time.time(),
+                     content = f"Whether to execute the tool {tool.name}",
+                     data={"arguments": tool_call.arguments},
+                )
+                 
+                 self.approval.reset()
+                 approved = await self.approval.wait()
+                 await self.task_manager.update_state(task_id, status=TaskStatus.RUNNING)
+
+                 if not approved:
+                    yield LoopEvent(
+                        event_type=EventType.APPROVAL_DENIED,
+                        task_id=task_id,
+                        timestamp=time.time(),
+                        content="用户拒绝执行或超时",
+                    )
+
+                    await self.task_manager.append_msg(task_id=task_id,new_msgs=[
+                        {"role":"assistant","content":llm_output},
+                        {"role":"user","content":f"[Approval Denied] {tool.name} rejected"}
+                    ])
+
+                    continue
+                 else:
+                    yield LoopEvent(
+                        event_type=EventType.APPROVAL_GRANTED,
+                        task_id=task_id,
+                        timestamp=time.time(),
+                        tool_name= tool.name
+                    )
+            
             yield LoopEvent(
                 event_type=EventType.TOOL_EXECUTION_STARTED,
                 task_id=task_id,
@@ -237,6 +285,7 @@ class AgentLoop:
                     event_type=EventType.TOOL_EXECUTION_FAILED,
                     task_id = task_id,
                     tool_name=tool.name,
+                    timestamp=time.time(),
                     error=result.error,
                     data ={
                         "error_type":result.error_type,
@@ -256,13 +305,10 @@ class AgentLoop:
                 },
             )
             
-            new_messages = messages + [
+            await self.task_manager.append_msg(task_id,[
                     {"role":"assistant","content":llm_output},
                     {"role":"user","content":f"Observation:{result.to_text()}"}
-                ]
-
-            await self.task_manager.update_state(task_id, messages = new_messages)
-
+                ])
         yield LoopEvent(
             event_type=EventType.TASK_FAILED,
             task_id=task_id,
@@ -271,7 +317,6 @@ class AgentLoop:
         )
         await self.task_manager.update_state(task_id, status=TaskStatus.FAILED)
 
-
     async def _execute_with_retry(self,task_id,tool:Tool,call:ToolCall):
         last_result = None
         total_latency_ms = 0.0
@@ -279,35 +324,28 @@ class AgentLoop:
         for attempt in range(self.retry_engine.policy.max_retries + 1):
             await self._check_cancelled()
 
-            start_time = time.time()
+            start_time = time.perf_counter()
             result = await self.execute_engine.execute(task_id,tool,call.arguments)
-            total_latency_ms += start_time
+            end_time = time.perf_counter()
+
+            total_latency_ms += (end_time - start_time) * 1000
 
             if not result.is_error :
                 result.retry_count = attempt
                 return result,total_latency_ms
             
             last_result = result
-            
-            if attempt < self.retry_engine.policy.max_retries and result.is_retryable:
-                delay = self.retry_engine.calc_delay(attempt,result.error_type)
-                # yield LoopEvent(
-                #     event_type=EventType.TOOL_RETRY_SCHEDULED,
-                #     task_id=task_id,
-                #     tool_name= tool.name,
-                #     timestamp=time.time(),
-                #     data={
-                #         "attempt":attempt+1,
-                #         "delay":delay
-                #     }
-                # )   
 
-                await asyncio.sleep(delay)
-                result.retry_count = attempt + 1
-            else:
+            is_last_attempt = (attempt == self.retry_engine.policy.max_retries)
+            if is_last_attempt and not result.is_retryable:
                 break
+            
+            delay = self.retry_engine.calc_delay(attempt,result.error_type)
 
-            return last_result,total_latency_ms
+            await asyncio.sleep(delay)
+            result.retry_count = attempt + 1
+
+        return last_result,total_latency_ms
 
 
     def _execute_with_defense(self,tool:Tool, call:ToolCall):
