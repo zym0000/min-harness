@@ -16,7 +16,7 @@ class AsyncExecutionEngine:
                 if tool.executor_type == "subprocess":
                     await self._excute_subprocess(tool,arguments)
                 else:
-                    output = tool.execute(**arguments)
+                    output = await tool.execute(**arguments)
                     return ToolResult(
                         tool_name= tool.name,
                         arguments=arguments,
