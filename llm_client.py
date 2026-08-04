@@ -1,115 +1,175 @@
-
-
-import re
-from tool_manger import ToolRegistry
-from typing import List,Dict,Optional
 import asyncio
+import os
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, List, Optional, Union
+
+import openai
+
+@dataclass
+class ChatResponse:
+    """统一的 LLM 响应结构，兼容 _is_response_frame 的类型检查"""
+    text: str = ""                           # 模型输出的最终文本（流式时可能为空）
+    usage: Optional[Dict[str, int]] = None   # token 用量 {"prompt_tokens": ..., "completion_tokens": ...}
+    tool_calls: Optional[List[Dict]] = None  # 原生 tool_calls 列表
+    reasoning_content:Optional[str] = None   # 兼容deepseek 工具调用，要求如果有返回需要带
 
 class LLMClient:
-    def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None):
-        return NotImplemented
+    """基于 OpenAI 兼容 API 的 LLM 客户端，支持工具调用和流式输出"""
 
+    def __init__(
+        self,
+        model: str = "gpt-4o",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        temperature: float = 0.2,
+        max_tokens: int = 4096,
+        timeout: float = 60.0,
+    ):
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+        self.timeout = timeout
 
-class MockLLMClient(LLMClient):
-    def __init__(self, registry: ToolRegistry):
-        self.registry = registry
+        # 使用 openai 库的异步客户端
+        self._client = openai.AsyncOpenAI(
+            api_key=api_key or os.getenv("OPENAI_API_KEY"),
+            base_url=base_url or os.getenv("OPENAI_BASE_URL"),
+            timeout=timeout,
+        )
 
     async def chat(
-        self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None
-    ) -> str:
-        await asyncio.sleep(0.1)
-        for msg in reversed(messages):
-            content = msg.get("content", "")
-            if any(marker in content for marker in ["[Tool Result]", "[Tool Error]", "[Parse Error]", "[Approval Denied]"]):
-                return self._generate_summary(content)
+        self,
+        messages: List[Dict[str, Any]],
+        tool_schema: Optional[List[Dict[str, Any]]] = None,
+    ) -> ChatResponse:
+        """一次性调用，返回完整的 ChatResponse(包含 text, usage, tool_calls)"""
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+        }
+        if tool_schema:
+            kwargs["tools"] = tool_schema
 
-        user_input = ""
-        for msg in reversed(messages):
-            if msg.get("role") == "user":
-                user_input = msg.get("content", "").lower()
-                break
-        
-        if "天气" in user_input or "weather" in user_input:
-            city = self._extract_city(user_input)
-            return f'Thought: 用户想查询天气。\nAction: get_weather\nAction Input: {{"city": "{city}"}}'
-        elif "计算" in user_input or any(op in user_input for op in ["+", "-", "*", "/"]):
-            expr = self._extract_expr(user_input)
-            return f'Thought: 用户需要计算。\nAction: calculate\nAction Input: {{"expression": "{expr}"}}'
-        elif "文件" in user_input or "read" in user_input:
-            return 'Thought: 用户想读取文件。\nAction: read_file\nAction Input: {"path": "example.txt"}'
-        elif "数据库" in user_input or "query" in user_input or "搜索" in user_input:
-            return 'Thought: 用户需要查询数据库。\nAction: query_database\nAction Input: {"query": "SELECT * FROM users"}'
-        elif "邮件" in user_input or "email" in user_input:
-            return 'Thought: 用户想发送邮件。\nAction: send_email\nAction Input: {"to": "user@example.com", "subject": "测试", "body": "测试邮件"}'
-        elif "编辑" in user_input or "修改" in user_input or "replace" in user_input:
-            return 'Thought: 用户想编辑文件。\nAction: str_replace_editor\nAction Input: {"command": "view", "path": "example.txt"}'
-        elif "命令" in user_input or "bash" in user_input or "shell" in user_input:
-            return 'Thought: 用户想执行命令。\nAction: bash\nAction Input: {"command": "ls -la"}'
-        elif "grep" in user_input or "查找" in user_input:
-            return 'Thought: 用户想搜索代码。\nAction: grep_search\nAction Input: {"query": "def main", "path": "."}'
-
-        return "我理解了您的请求。这是一个模拟回复。"
-
-    def _extract_city(self, text: str) -> str:
-        match = re.search(r"([北京上海广州深圳杭州成都武汉西安]{2})", text)
-        return match.group(1) if match else "北京"
-
-    def _extract_expr(self, text: str) -> str:
-        match = re.search(r"([\d\s+\-*/.()]+)", text)
-        if match:
-            expr = match.group(1).replace(" ", "")
-            if expr and any(c in expr for c in "+-*/"):
-                return expr
-        match = re.search(r"(.+?)(?:等于|=|是多少)", text)
-        if match:
-            return match.group(1).strip().replace(" ", "")
-        return "1+1"
-
-    def _generate_summary(self, tool_result: str) -> str:
-        if "get_weather" in tool_result:
-            return "根据天气查询结果，今天天气不错，适合外出。"
-        elif "calculate" in tool_result:
-            return "计算已完成，结果如上所示。"
-        elif "read_file" in tool_result:
-            return "文件内容已读取，请查看上面的结果。"
-        elif "query_database" in tool_result:
-            return "数据库查询已完成，结果已返回。"
-        elif "send_email" in tool_result:
-            return "邮件已发送（模拟）。"
-        elif "str_replace_editor" in tool_result:
-            return "文件编辑已完成。"
-        elif "bash" in tool_result:
-            return "命令执行完成。"
-        elif "grep_search" in tool_result:
-            return "搜索完成，结果已返回。"
-        return "任务已根据工具返回结果完成。"
-
-class OpenAILLMClient(LLMClient):
-    def __init__(self, api_key: Optional[str] = None, base_url: Optional[str] = None, model: str = "gpt-4o-mini"):
         try:
-            from openai import OpenAI
-        except ImportError:
-            raise ImportError("请安装 openai: pip install openai")
-        self.client = OpenAI(api_key=api_key, base_url=base_url)
-        self.model = model
-
-    def chat(self, messages: List[Dict[str, str]], tools: Optional[List[Dict]] = None) -> str:
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto" if tools else None,
-                temperature=0.7,
-                max_tokens=2000
-            )
-            message = response.choices[0].message
-            if hasattr(message, "tool_calls") and message.tool_calls:
-                tool_call = message.tool_calls[0]
-                return f'Thought: 我需要调用工具。\nAction: {tool_call.function.name}\nAction Input: {tool_call.function.arguments}'
-            return message.content or ""
+            response = await self._client.chat.completions.create(**kwargs)
         except Exception as e:
-            return f"[LLM Error] {str(e)}"
+            raise RuntimeError(f"LLM call failed: {e}") from e
 
-    
+        choice = response.choices[0]
+        text = choice.message.content or ""
+        reasoning = getattr(choice.message,"reasoning_content",None)
 
+        # 提取 tool_calls
+        tool_calls = None
+        if choice.message.tool_calls:
+            tool_calls = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in choice.message.tool_calls
+            ]
+
+        usage = None
+        if response.usage:
+            usage = {
+                "prompt_tokens": response.usage.prompt_tokens,
+                "completion_tokens": response.usage.completion_tokens,
+                "total_tokens": response.usage.total_tokens,
+            }
+
+        return ChatResponse(text=text, usage=usage, tool_calls=tool_calls,reasoning_content=reasoning)
+
+    async def chat_stream(
+        self,
+        messages: List[Dict[str, Any]],
+        tool_schema: Optional[List[Dict[str, Any]]] = None,
+    ) -> AsyncIterator[Union[str, ChatResponse]]:
+        """
+        流式调用：
+        - 每步 yield 文本增量
+        - 最后 yield 一个 ChatResponse 对象 (包含最终 usage 和 tool_calls)
+        """
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "stream": True,
+        }
+        if tool_schema:
+            kwargs["tools"] = tool_schema
+
+        try:
+            stream = await self._client.chat.completions.create(**kwargs)
+        except Exception as e:
+            raise RuntimeError(f"LLM stream call failed: {e}") from e
+
+        collected_text = ""
+        collected_tool_calls: List[Dict[str, Any]] = []
+        final_usage = None
+        collected_reasoning = ""
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta is None:
+                continue
+
+            # 文本增量
+            if delta.content:
+                collected_text += delta.content
+                yield delta.content
+
+            if getattr(delta,'reasoning_content',None):
+                collected_reasoning += delta.reasoning_content
+
+            # 工具调用增量（需要收集拼接）
+            if delta.tool_calls:
+                for tc_delta in delta.tool_calls:
+                    # 确保列表长度足够
+                    while len(collected_tool_calls) <= tc_delta.index:
+                        collected_tool_calls.append({
+                            "id": "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        })
+                    if tc_delta.id:
+                        collected_tool_calls[tc_delta.index]["id"] = tc_delta.id
+                    if tc_delta.function:
+                        if tc_delta.function.name:
+                            collected_tool_calls[tc_delta.index]["function"]["name"] = tc_delta.function.name
+                        if tc_delta.function.arguments:
+                            collected_tool_calls[tc_delta.index]["function"]["arguments"] += tc_delta.function.arguments
+
+            # 最后一个 chunk 通常带有 usage
+            if chunk.usage:
+                final_usage = {
+                    "prompt_tokens": chunk.usage.prompt_tokens,
+                    "completion_tokens": chunk.usage.completion_tokens,
+                    "total_tokens": chunk.usage.total_tokens,
+                }
+
+        # 构建最终响应
+        final_response = ChatResponse(
+            text=collected_text,                # 完整文本（可能被中间 yield 拆散了，这里汇总备用）
+            usage=final_usage,
+            tool_calls=collected_tool_calls if collected_tool_calls else None,
+            reasoning_content= collected_reasoning if collected_reasoning else None
+        )
+        yield final_response
+
+    async def aclose(self) -> None:
+        """关闭底层 httpx 连接池。"""
+        client = getattr(self, "_client", None)
+        if client is None:
+            return
+        if hasattr(client, "aclose"):
+            await client.aclose()
+        elif hasattr(client, "close"):
+            await asyncio.to_thread(client.close)

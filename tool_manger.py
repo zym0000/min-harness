@@ -27,7 +27,6 @@ class Tool:
             tags,
             dangerous = False,
             executor_type:str  = "async"):
-        
         self.name = name
         self.description = description
         self.func = func
@@ -101,12 +100,12 @@ class Tool:
             }
         }
     
-    async def execute(self, **kwargs):
+    async def execute(self, task_id:str,**kwargs):
         for param in self.parameters:
             param_dict = param.to_dict()
             if param_dict.get('required') and param_dict.get("name") not in kwargs:
                 raise ValueError(f"缺少必要参数 {param_dict.get("name")}")
-        
+        kwargs.setdefault('task_id',task_id)
         return await self.func(**kwargs)
 
 @dataclass
@@ -280,7 +279,7 @@ class ToolRegistry:
         tool_list = tools or self.list_tools()
         return "\n\n".join([t.to_react_description() for t in tool_list])
 
-    def to_openai_sechme(self,tools:Optional[List[Tool]] = None):
+    def to_openai_schema(self,tools:Optional[List[Tool]] = None):
         if tools is None:
             return []
         
