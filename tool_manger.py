@@ -1,5 +1,6 @@
 import re
 import json
+import asyncio,inspect
 from dataclasses import dataclass
 from typing import Any, Dict,Optional,List
 from tool_execute_process.error_classify import ToolErrorType
@@ -106,7 +107,11 @@ class Tool:
             if param_dict.get('required') and param_dict.get("name") not in kwargs:
                 raise ValueError(f"缺少必要参数 {param_dict.get("name")}")
         kwargs.setdefault('task_id',task_id)
-        return await self.func(**kwargs)
+        if inspect.iscoroutinefunction(self.func):
+            return await self.func(**kwargs)
+        else:
+            # 将同步函数放到线程池执行，await 等待线程池返回结果
+            return await asyncio.to_thread(self.func, **kwargs)
 
 @dataclass
 class ToolCall:
@@ -231,6 +236,7 @@ class ToolResult:
     retry_count:int = 0
     error_type:Optional[ToolErrorType] = None
     is_retryable:bool = False
+    data:Optional[Dict[str,Any]] = None
 
     @property
     def is_error(self):
