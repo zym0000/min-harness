@@ -18,7 +18,7 @@ class CompressionStrategy(Enum):
 class ContextManager:
 
     # 增量提取触发阈值的默认值
-    MIN_NEW_MESSAGES_FOR_EXTRACT = 6
+    MIN_NEW_MESSAGES_FOR_EXTRACT = 20
 
     def __init__(self,
                  max_tokens: int = 8000,       # LLM 窗口大小

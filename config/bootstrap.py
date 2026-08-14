@@ -47,9 +47,9 @@ async def bootstrap(
     tool_registry.register_mcp_tools(wrapped_tools)
 
     llm = LLMClient(
-        api_key=os.environ.get("OPENAI_API_KEY", "xxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
-        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.deepseek.com"),
-        model=model or os.environ.get("AGENT_MODEL", "deepseek-v4-flash"),
+        api_key=os.environ.get("OPENAI_API_KEY", "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
+        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.minimaxi.com/v1"),
+        model=model or os.environ.get("AGENT_MODEL", "MiniMax-M3"),
         timeout=120.0,
     )
 
@@ -60,8 +60,8 @@ async def bootstrap(
         approval_timeout=300.0,
         max_consecutive_parse_errors=3,
         enable_watchdog=True,
-        context_max_tokens=12000,
-        context_reserve_tokens=3000,
+        context_max_tokens=100000,
+        context_reserve_tokens=10000,
         store_path=store_path,
     )
 
