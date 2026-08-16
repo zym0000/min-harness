@@ -31,7 +31,14 @@ class HarnessConfig:
     context_reserve_tokens: int = 2000       # 给回答预留的 token
     task_max_history: int = 100              # 单任务消息历史上限
     store_path: Optional[str] = None         # SQLite 检查点路径；None=纯内存
-
+    #sub agent
+    max_subagent_depth:int = 3               #sub agent 最大深度
+    #max_subagent_prompt_chars: int = 0      #sub agent prompt 最大字符数
+    subagent_heartbeat_interval: float = 2.0  #sub agent 心跳时常
+    max_subagent_events: int = 5000          #sub agent 事件最大数量
+    max_subagent_states: int = 1000          # sub agent 最大状态
+    subagent_tool_timeout: float = 1800.0    # sub_agent 工具调用超时秒数(默认 30min,覆盖 engine 默认 30s)
+    
 class Harness:
     def __init__(self,
                  registry: ToolRegistry,
@@ -69,6 +76,12 @@ class Harness:
         #运行结果缓存（任务结束后仍可查）
         self._loops: Dict[str, AgentLoop] = {}
         self._run_results: Dict[str, LoopRunResult] = {}
+
+        # sub-agent 集成所需字段(被 subagent/runner.py 读取)
+        # _loop_tools: task_id -> 当前 AgentLoop 看到的工具集,sub-agent 用此继承父的工具范围
+        self._loop_tools: Dict[str, List[Tool]] = {}
+        # _subagent_states: subagent_id -> 状态对象
+        self._subagent_states: Dict[str, Any] = {}
 
     #任务提交
     async def submit_task(self, user_input: str):
@@ -124,8 +137,10 @@ class Harness:
             approval_timeout=self.config.approval_timeout,
             max_consecutive_parse_errors=self.config.max_consecutive_parse_errors,
         )
-        self._loops[task_id] = loop                           
-        trace_id = task_id                                  
+        self._loops[task_id] = loop
+        # sub-agent 通过 harness._loop_tools[parent_task_id] 拿到父任务的工具集
+        self._loop_tools[task_id] = list(filtered_tools)
+        trace_id = task_id
 
         async def _task_wrapper():
             # 手动管理信号量——审批等待期间释放并发额度
@@ -157,6 +172,7 @@ class Harness:
                 # 缓存 RunResult 供事后查询
                 self._run_results[task_id] = loop.get_run_result(user_input)
                 self._loops.pop(task_id, None)
+                self._loop_tools.pop(task_id, None)
                 self.cancel_events.pop(task_id, None)
                 self.approval_gates.pop(task_id, None)
 
@@ -195,6 +211,15 @@ class Harness:
     def get_run_result(self, task_id: str) -> Optional[LoopRunResult]:
         """运行结束后的汇总结果；任务不存在或未结束返回 None。"""
         return self._run_results.get(task_id)
+
+    def get_subagent_states_for_parent(self, parent_task_id: str) -> List[Any]:
+        """返回指定父任务派生的所有 sub-agent 状态(按创建时间排序)。"""
+        states = [
+            s for s in self._subagent_states.values()
+            if s.parent_task_id == parent_task_id
+        ]
+        states.sort(key=lambda s: s.created_at)
+        return states
 
     # 控制面
     async def grant_approval(self, task_id: str):
@@ -236,20 +261,15 @@ class Harness:
         self.cancel_events.pop(task_id, None)
         self.approval_gates.pop(task_id, None)
         self._loops.pop(task_id, None)
+        self._loop_tools.pop(task_id, None)
         self._run_results.pop(task_id, None)
 
-        loop_tools = getattr(self, "_loop_tools", None)
-        if loop_tools is not None:
-            loop_tools.pop(task_id, None)
-
-        subagent_states = getattr(self, "_subagent_states", None)
-        if subagent_states is not None:
-            stale = [
-                sid for sid, s in subagent_states.items()
-                if getattr(s, "parent_task_id", None) == task_id
-            ]
-            for sid in stale:
-                subagent_states.pop(sid, None)
+        stale = [
+            sid for sid, s in self._subagent_states.items()
+            if getattr(s, "parent_task_id", None) == task_id
+        ]
+        for sid in stale:
+            self._subagent_states.pop(sid, None)
 
         return True
 
@@ -272,6 +292,11 @@ class Harness:
 
     #指标
     def _record_metrics(self, event: LoopEvent):
+        # sub-agent 事件不计入主任务 metrics——避免子代理的工具调用 / LLM 计数污染父任务
+        # 父 LLM 看到的最终 ToolResult 走标准路径(已计入),中间事件不计
+        if event.data and event.data.get("subagent_id"):
+            return
+
         if event.event_type == EventType.TOOL_EXECUTION_COMPLETED:
             latency_ms = event.data.get("latency_ms", 0) if event.data else 0
             retry_count = event.data.get("retry_count", 0) if event.data else 0

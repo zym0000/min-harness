@@ -1,9 +1,10 @@
 import asyncio
+import contextvars
 import json
 import time
 from dataclasses import dataclass
 from enum import auto, Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from antioscillation_watchdog import AntioscillationWatchDog
 #from interaction.approval_gate import ApprovalGate
@@ -13,6 +14,15 @@ from llm_client import LLMClient
 from task.task_manager import ContextManager, TaskManager, TaskStatus
 from tool_execute_process.retry_engine import RetryEngine
 from tool_manger import ToolCall, ToolCallParser
+
+# Sub-agent sink:由 AgentLoop.run() 在 run 期间 set,subagent/runner.py 读。
+# 放在 agent_loop.py 是因为 owner 是 AgentLoop;依赖方向是 runner → agent_loop,
+# 不会形成循环 import。
+EventSink = Callable[[LoopEvent], None]
+_current_event_sink: contextvars.ContextVar[Optional[EventSink]] = contextvars.ContextVar(
+    "agent_loop_subagent_event_sink",
+    default=None,
+)
 
 class LoopState(Enum):
     IDLE = auto()
@@ -88,11 +98,23 @@ class AgentLoop:
         # 工具 schema 缓存
         self._schema_cache_key: Optional[tuple] = None
         self._schema_cache_value: Any = None
+        # sub-agent 通过 _current_event_sink 把实时事件 push 到这里,run() 在迭代间隙 drain
+        self._external_events: asyncio.Queue = asyncio.Queue()
 
     # 基础
     async def _check_cancelled(self):
         if self.cancel_event.is_set():
             raise asyncio.CancelledError()
+
+    def _drain_external_events(self) -> List[LoopEvent]:
+        """非阻塞清空 sub-agent 推过来的事件队列。空队列返回 []。"""
+        out: List[LoopEvent] = []
+        while True:
+            try:
+                out.append(self._external_events.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return out
 
     def _record_step(self, step_num: int, llm_out: str = "",
                      tool_call: Optional[Any] = None, tool_result: Optional[Any] = None,
@@ -156,10 +178,20 @@ class AgentLoop:
             timestamp=time.time(),
         )
 
+        # 安装 sink:子代理在工具调用内部运行时,实时事件推到 self._external_events
+        sink_token = _current_event_sink.set(self._external_events.put_nowait)
         final_status = TaskStatus.FAILED
         try:
             async for event in self._execute_steps(task_id, tools):
+                # 先把子代理在上一段时间里产生的事件 yield 出去,再 yield 当前事件
+                # 这样 CLI 看到的是"子代理做了一堆事 → sub_agent 完成"
+                for ext in self._drain_external_events():
+                    yield ext
                 yield event
+
+            # own loop 自然结束后,再 drain 一次残余事件(子代理最后一次的工具调用等)
+            for ext in self._drain_external_events():
+                yield ext
 
             final_status = TaskStatus.COMPLETED
         except asyncio.CancelledError:
@@ -194,6 +226,11 @@ class AgentLoop:
                     pass
             raise
         finally:
+            try:
+                _current_event_sink.reset(sink_token)
+            except Exception:
+                pass
+
             if self.watch_dog:
                 self.watch_dog.clear_task(task_id)
 
@@ -710,6 +747,19 @@ self._feedback_msg(f"Observation [Tool Error]: 工具 {tool_call.tool_name} 不�
                     },
                 )
 
+            # sub-agent 事件回放:子代理返回的 ToolResult.data["events"] 包含完整子代理事件流
+            # 这里 post-hoc yield 出去,让父的 event stream / CLI 能看到子代理完整执行过程
+            # 实时错误/心跳已通过 sink 路径推到 _external_events(drain 时已 yield)
+            # 这里只补齐 sink 没覆盖的部分(THINKING_*, TOOL_EXECUTION_*, FINAL_ANSWER 等)
+            replayed = (result.data or {}).get("events") if result.data else None
+            if replayed:
+                for sub_event in replayed:
+                    # 不重 yield sub_agent 工具自己的 COMPLETED(就是上面那条),
+                    # 避免重复。其它子代理事件都 forward
+                    if sub_event.tool_name == "sub_agent":
+                        continue
+                    yield sub_event
+
             # 状态转移（仅"转移被拒绝"才跳过 Observation）
             if not result.is_error and hasattr(self.tool_registry, "transit_task_skill_state"):
                 error_msg = await self.tool_registry.transit_task_skill_state(
@@ -766,7 +816,10 @@ self._feedback_msg(f"Observation [Tool Error]: 工具 {tool_call.tool_name} 不�
             await self._check_cancelled()
 
             start_time = time.perf_counter()
-            result = await self.execute_engine.execute(task_id, tool, call.arguments)
+            # 透传 tool.timeout(None 表示走 engine 默认 30s)
+            tool_timeout = getattr(tool, "timeout", None)
+            result = await self.execute_engine.execute(
+                task_id, tool, call.arguments, timeout=tool_timeout)
             end_time = time.perf_counter()
 
             total_latency_ms += (end_time - start_time) * 1000

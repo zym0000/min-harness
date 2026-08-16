@@ -8,6 +8,7 @@ from skill.registry import UnifiedToolRegistry
 from skill.skill import ProgressiveSkillManager
 from harness import Harness, HarnessConfig
 from llm_client import LLMClient
+from subagent import make_sub_agent_tool
 
 async def bootstrap(
     workspace: str = "./workspace",
@@ -66,6 +67,10 @@ async def bootstrap(
     )
 
     harness = Harness(registry=tool_registry, llm=llm, config=cfg)
+
+    # 注册 sub_agent 内置工具（非门控、tag=general）。闭包捕获 harness,
+    # 使 Tool.func 能访问 _loop_tools / _subagent_depth / approval_gates 等。
+    tool_registry.register(make_sub_agent_tool(harness))
 
     restored = await harness.restore_tasks()
     if restored:
