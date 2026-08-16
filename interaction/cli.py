@@ -1,6 +1,6 @@
 import asyncio
 import os
-import sys
+import subprocess
 import shutil
 from typing import Optional
 
@@ -224,7 +224,7 @@ class InteractiveCLI:
             else:
                 print(f"  {D}no active task{R}")
         elif c == "/clear":
-            os.system("clear" if os.name != "nt" else "cls")
+            subprocess.run("clear" if os.name != "nt" else "cls",shell=True)
             tid = self.task_id
             if not tid:
                 print(f"  {D}no active task — screen cleared{R}")
