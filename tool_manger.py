@@ -27,7 +27,8 @@ class Tool:
             func,
             tags,
             dangerous = False,
-            executor_type:str  = "async"):
+            executor_type:str  = "async",
+            timeout: Optional[float] = None):
         self.name = name
         self.description = description
         self.func = func
@@ -35,6 +36,7 @@ class Tool:
         self.dangerous = dangerous #函数执行危险标记
         self.tags = tags
         self.executor_type = executor_type, #async, subprocess
+        self.timeout = timeout  # 工具执行超时秒数;None 表示走 engine 默认(30s)
 
 
     #大模型tool 调用有两种方式一个React 模板
