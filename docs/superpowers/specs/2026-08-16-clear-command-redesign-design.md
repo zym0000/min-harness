@@ -44,12 +44,12 @@ async def clear_task(self, task_id: str) -> bool:
 **Returns:** `True` if cleanup happened; `False` if `task_id` was unknown.
 
 **Algorithm:**
-1. **Early exit:** If `task_id not in self.task_manager.tasks` and `task_id not in self.cancel_events`, return `False`.
-2. **Cancel:** `await self.cancel_task(task_id)` — sets the cancel event and cancels in-flight tool executions via the engine. Idempotent.
-3. **Wait for loop exit:** Loop up to 50 iterations × 100 ms (`asyncio.sleep(0.1)`). Exit early when `task_id not in self._loops`. The wrapper's `finally` block pops `_loops[task_id]` when the loop terminates, so this is the natural signal.
+1. **Early exit:** If `task_id not in self.task_manager.tasks`, return `False`. (`cancel_events` is unreliable — the wrapper's `finally` pops it on natural exit, so an absent entry does not mean "task doesn't exist.")
+2. **Cancel:** `await self.cancel_task(task_id)` — sets the cancel event and cancels in-flight tool executions via the engine. Idempotent. If the loop has already exited, this is a no-op.
+3. **Wait for loop exit:** Loop up to 50 iterations × 100 ms (`asyncio.sleep(0.1)`). Exit early when `task_id not in self._loops`. The wrapper's `finally` block pops `_loops[task_id]` when the loop terminates, so this is the natural signal. If the task never reached `_loops` (PENDING status, no loop started), the wait exits on iteration 0.
 4. **Delete state:** `await self.task_manager.delete_task(task_id)` — existing method; deletes the SQLite row and pops `tasks[task_id]`.
 5. **Defensive cleanup:** `pop(task_id, None)` on `cancel_events`, `approval_gates`, `_loops`, `_loop_tools`, `_run_results`. These are independent of step 4 because `_task_wrapper`'s `finally` block only pops some of them, and may have already done so before our timeout fired.
-6. **Sub-agent cleanup:** Iterate `self._subagent_states`; for every state whose `parent_task_id == task_id`, pop it from the dict. No cascade — orphaned grandchildren are out of scope.
+6. **Sub-agent cleanup:** Iterate `self._subagent_states`; for every state whose `parent_task_id == task_id`, pop it from the dict. Iteration-during-pop is safe in CPython ≥ 3 (dict iteration sees a snapshot). No cascade — orphaned grandchildren are out of scope.
 
 ### 3.2 CLI Wrapper: `/clear`
 
@@ -61,13 +61,13 @@ elif c == "/clear":
     tid = self.task_id
     if not tid:
         print(f"  {D}no active task — screen cleared{R}")
-        continue
-    cleared = await self.harness.clear_task(tid)
-    self.task_id = None
-    if cleared:
-        print(f"  {YEL}task cleared: {tid[:12]}…{R}")
     else:
-        print(f"  {D}task already gone — screen cleared{R}")
+        cleared = await self.harness.clear_task(tid)
+        self.task_id = None
+        if cleared:
+            print(f"  {YEL}task cleared: {tid[:12]}…{R}")
+        else:
+            print(f"  {D}task already gone — screen cleared{R}")
 ```
 
 ### 3.3 Help Text Update
