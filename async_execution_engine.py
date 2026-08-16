@@ -18,6 +18,19 @@ class AsyncExecutionEngine:
                     await self._excute_subprocess(tool,arguments)
                 else:
                     output = await tool.execute(task_id,**arguments)
+                    # Tool.execute 可能返回 ToolResult(自定义封装,如 sub_agent),
+                    # 也可能是原始输出(string/dict)。若是 ToolResult,解包并合并 data/error 等字段。
+                    if isinstance(output, ToolResult):
+                        return ToolResult(
+                            tool_name=tool.name,
+                            arguments=arguments,
+                            output=output.output,
+                            error=output.error,
+                            retry_count=output.retry_count,
+                            error_type=output.error_type,
+                            is_retryable=output.is_retryable,
+                            data=output.data,
+                        )
                     return ToolResult(
                         tool_name= tool.name,
                         arguments=arguments,

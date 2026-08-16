@@ -101,7 +101,6 @@ class AgentLoop:
         # sub-agent 通过 _current_event_sink 把实时事件 push 到这里,run() 在迭代间隙 drain
         self._external_events: asyncio.Queue = asyncio.Queue()
 
-    # 基础
     async def _check_cancelled(self):
         if self.cancel_event.is_set():
             raise asyncio.CancelledError()
