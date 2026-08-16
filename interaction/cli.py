@@ -11,7 +11,7 @@ from prompt_toolkit.completion import Completer, Completion
 
 from harness import Harness
 from event.event import EventType
-from interaction.display import render, R, B, CYN, GRN, YEL, D, RED
+from interaction.display import render, R, B, D, WHT, BLU, GRN, YEL, CYN, RED
 
 BANNER = f"""
 {CYN}{B}
@@ -48,8 +48,8 @@ HELP = f"""
 
 async def prompt_approval(tool_name: str, arguments: dict) -> tuple[bool, str]:
     """占位审批函数，请替换为实际交互逻辑。"""
-    print(f"  {YEL}[APPROVAL] {tool_name} {arguments}{R}")
-    ans = input(f"  {GRN}Approve? (y/n): {R}").strip().lower()
+    print(f"  {YEL}[APPROVAL] {BLU}{tool_name}{YEL} {arguments}{R}")
+    ans = input(f"  {WHT}Approve? (y/n): {R}").strip().lower()
     if ans == 'y':
         return True, ""
     else:
@@ -155,7 +155,7 @@ class InteractiveCLI:
             else:
                 await self._chat(text)
 
-        print(f"\n  {CYN} bye{R}")
+        print(f"\n  {BLU} bye{R}")
 
     async def _chat(self, text: str):
         """处理用户输入的普通对话"""
@@ -204,14 +204,14 @@ class InteractiveCLI:
             print(HELP)
         elif c == "/tools":
             tools = self.harness.registry.list_tools()
-            print(f"\n  {CYN}{B}Tools ({len(tools)}):{R}")
+            print(f"\n  {BLU}{B}Tools ({len(tools)}):{R}")
             for t in tools:
                 ap = " " if getattr(t, "requires_approval", False) else ""
-                print(f"    • {t.name}{ap}")
+                print(f"    {WHT}• {BLU}{t.name}{R}")
             print()
         elif c == "/status":
-            print(f"\n  {CYN}task: {self.task_id or 'none'}{R}")
-            print(f"  {CYN}workspace: {self.workspace}{R}")
+            print(f"\n  {BLU}task:{R}      {WHT}{self.task_id or 'none'}{R}")
+            print(f"  {BLU}workspace:{R} {WHT}{self.workspace}{R}")
             m = self.harness.get_metrics_summary()
             if m:
                 print(f"  {D}metrics: {m}{R}")
