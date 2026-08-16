@@ -7,6 +7,7 @@ from tools.mcp_wrapped_tool import create_pool_and_discover
 from skill.registry import UnifiedToolRegistry
 from skill.skill import ProgressiveSkillManager
 from harness import Harness, HarnessConfig
+from config.loader import resolve_llm, resolve_paths
 from llm_client import LLMClient
 from subagent import make_sub_agent_tool
 
@@ -28,8 +29,27 @@ async def bootstrap(
             Path(__file__).parent.parent / "tools" / "coding_tools_server.py"
         )
 
+    resolved = resolve_paths(
+        default_skills_dir=skills_dir,
+        default_mcp_server_script=mcp_server_script
+            or str(Path(__file__).parent.parent / "tools" / "coding_tools_server.py"),
+    )
+    print(f"  [bootstrap] resolved paths:")
+    print(f"    skills_dir:        {resolved.skills_dir}")
+    print(f"    mcp_server_script: {resolved.mcp_server_script}")
+
+    resolved_llm = resolve_llm(
+        default_api_key=None,
+        default_base_url="https://api.minimaxi.com/v1",
+        default_model=model or "MiniMax-M3",
+    )
+    print(f"  [bootstrap] resolved llm:")
+    print(f"    base_url: {resolved_llm.base_url}")
+    print(f"    model:    {resolved_llm.model}")
+    print(f"    api_key:  {'<set>' if resolved_llm.api_key else '<unset>'}")
+
     _, wrapped_tools = await create_pool_and_discover(
-        server_script=mcp_server_script,
+        server_script=str(resolved.mcp_server_script),
         server_name="coding-tools",
         mode="InMemoryStack",
         mcp_variable_name="mcp",
@@ -39,7 +59,7 @@ async def bootstrap(
     print(f"  [bootstrap] {len(wrapped_tools)} tools: "
           f"{[t.name for t in wrapped_tools]}")
 
-    skill_mgr = ProgressiveSkillManager(skills_dir=skills_dir)
+    skill_mgr = ProgressiveSkillManager(skills_dir=str(resolved.skills_dir))
     skill_mgr.load_all_skills()
     print(f"  [bootstrap] {len(skill_mgr.skills_pool)} skills: "
           f"{list(skill_mgr.skills_pool.keys())}")
@@ -48,9 +68,9 @@ async def bootstrap(
     tool_registry.register_mcp_tools(wrapped_tools)
 
     llm = LLMClient(
-        api_key=os.environ.get("OPENAI_API_KEY", "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"),
-        base_url=os.environ.get("OPENAI_BASE_URL", "https://api.minimaxi.com/v1"),
-        model=model or os.environ.get("AGENT_MODEL", "MiniMax-M3"),
+        api_key=resolved_llm.api_key,
+        base_url=resolved_llm.base_url,
+        model=resolved_llm.model,
         timeout=120.0,
     )
 
