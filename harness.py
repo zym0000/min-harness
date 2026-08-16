@@ -215,6 +215,44 @@ class Harness:
         self.engine.cancel_execution(task_id)
         return True
 
+    async def clear_task(self, task_id: str) -> bool:
+        """清空 task 全部状态(含 SQLite + harness 级缓存 + 派生 sub-agent)。
+
+        若 loop 仍在跑,先 cancel 并等待退出再清理。
+        返回 True 表示清理发生,False 表示 task 不存在。
+        """
+        if task_id not in self.task_manager.tasks:
+            return False
+
+        await self.cancel_task(task_id)
+
+        for _ in range(50):
+            if task_id not in self._loops:
+                break
+            await asyncio.sleep(0.1)
+
+        await self.task_manager.delete_task(task_id)
+
+        self.cancel_events.pop(task_id, None)
+        self.approval_gates.pop(task_id, None)
+        self._loops.pop(task_id, None)
+        self._run_results.pop(task_id, None)
+
+        loop_tools = getattr(self, "_loop_tools", None)
+        if loop_tools is not None:
+            loop_tools.pop(task_id, None)
+
+        subagent_states = getattr(self, "_subagent_states", None)
+        if subagent_states is not None:
+            stale = [
+                sid for sid, s in subagent_states.items()
+                if getattr(s, "parent_task_id", None) == task_id
+            ]
+            for sid in stale:
+                subagent_states.pop(sid, None)
+
+        return True
+
     async def shutdown(self) -> None:
         """统一关停:engine -> LLM client -> store。幂等。"""
         await self.engine.shutdown()

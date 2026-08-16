@@ -29,7 +29,7 @@ HELP = f"""
   /tools      list tools
   /status     metrics & state
   /cancel     cancel running task (also: Ctrl+C during a running task)
-  /clear      clear screen
+  /clear      clear screen + reset current task memory
   /quit       exit
 
 {YEL}Usage:{R}
@@ -224,7 +224,17 @@ class InteractiveCLI:
             else:
                 print(f"  {D}no active task{R}")
         elif c == "/clear":
-            sys.system("clear" if os.name != "nt" else "cls")
+            os.system("clear" if os.name != "nt" else "cls")
+            tid = self.task_id
+            if not tid:
+                print(f"  {D}no active task — screen cleared{R}")
+            else:
+                cleared = await self.harness.clear_task(tid)
+                self.task_id = None
+                if cleared:
+                    print(f"  {YEL}task cleared: {tid[:12]}…{R}")
+                else:
+                    print(f"  {D}task already gone — screen cleared{R}")
         elif c == "/metrics":
             self.harness.print_metrics()
         else:
