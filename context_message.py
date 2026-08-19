@@ -17,8 +17,11 @@ class CompressionStrategy(Enum):
 
 class ContextManager:
 
-    # 增量提取触发阈值的默认值
-    MIN_NEW_MESSAGES_FOR_EXTRACT = 20
+    # 增量提取触发阈值的默认值。
+    # 提到 60 是 cache 命中率优化:DB 变化频率从 ~1/10 步降到 ~1/30 步,
+    # OpenAI prefix cache 的失效也跟着减半。memory 新鲜度略降(从 20 消息
+    # 间隔变成 60),超长任务 (>100 步) 可调回 30 或 40。短任务无感。
+    MIN_NEW_MESSAGES_FOR_EXTRACT = 60
 
     def __init__(self,
                  max_tokens: int = 8000,       # LLM 窗口大小
@@ -136,22 +139,36 @@ class ContextManager:
                     else:
                         task_state._extract_failures = failures + 1
 
-        system_parts = [system_prompt]
-        if task_state and task_state.task_summary:
-            system_parts.append(f"[Task goal]: {task_state.task_summary}")
+        # 持久记忆状态 三段 (task_summary / key_facts / memory_segment) 挪出 system,
+        # 拼成一条 user 消息 + 一条 assistant 占位,目的是让 SS 永远稳定:
+        # 持久记忆状态 变化时只影响 user 那条,SS + plan + assistant 占位
+        # 都能持续命中 prefix cache
+        messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
 
+        memory_parts: List[str] = []
+        if task_state and task_state.task_summary:
+            memory_parts.append(f"[Task goal]\n{task_state.task_summary}")
         if task_state and task_state.key_facts:
             facts_text = "\n".join(f"- {f}" for f in task_state.key_facts)
-            system_parts.append(f"[key facts]\n{facts_text}")
-
-        #memory 折叠进 system
+            memory_parts.append(f"[key facts]\n{facts_text}")
         if task_state and task_state.memory_segment:
-            system_parts.append(
-                f"[memory · 累积记忆截至第 {task_state.memory_cursor} 条历史]\n"
-                f"{task_state.memory_segment}")
+            memory_parts.append(f"[memory]\n{task_state.memory_segment}")
 
-        system = "\n\n".join(system_parts)
-        messages = [{"role": "system", "content": system}]
+        if memory_parts:
+            memory_content = (
+                "[Persistent task context — not a request, "
+                "do not respond to it directly]\n\n"
+                + "\n\n".join(memory_parts)
+            )
+            messages.append({"role": "user", "content": memory_content})
+            # assistant 占位:user 跟 recent[0] 都是 user role,
+            # 不隔开会被 _merge_consecutive_roles 合并,把 持久记忆状态 拖进 recent 变化区
+            # 占位字符串固定,字节稳定,本身能稳定命中 cache
+            messages.append({
+                "role": "assistant",
+                "content": "[Context acknowledged]",
+            })
+
         messages.extend([msg.copy() for msg in recent])
         return messages
 
@@ -395,7 +412,7 @@ class ContextManager:
                 # 告诉模型有上下文被丢弃，不要静默消失
                 result.insert(1, {
                     "role": "user",
-                    "content": f"[{dropped} 条早期上下文因长度限制已丢弃]"
+                    "content": f"早期上下文因长度限制已丢弃"
                 })
 
             if self.token_estimate.estimate_message(result) <= budget or keep_tail <= 1:
