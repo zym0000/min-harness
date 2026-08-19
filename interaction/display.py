@@ -1,4 +1,6 @@
 """终端事件渲染"""
+import re
+
 from event.event import EventType, LoopEvent
 
 # ANSI
@@ -12,6 +14,19 @@ YEL = "\033[93m"
 BLU = "\033[94m"
 MAG = "\033[95m"
 CYN = "\033[96m"
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+_FINAL_ANSWER_PREFIX = re.compile(r"^\s*final\s+answer\s*:\s*", re.IGNORECASE)
+
+
+def _clean_final_answer(text):
+    """Strip ``…`` blocks and a leading 'Final Answer:' prefix from LLM final-answer text."""
+    if not text:
+        return ""
+    cleaned = _THINK_BLOCK.sub("", text)
+    cleaned = _FINAL_ANSWER_PREFIX.sub("", cleaned, count=1)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 def render(event: LoopEvent):
     t = event.event_type
@@ -65,5 +80,5 @@ def render(event: LoopEvent):
 
     elif t == EventType.FINAL_ANSWER:
         print(f"  {BLU}{B}  Answer:{R}")
-        for ln in (event.content or "").splitlines():
+        for ln in _clean_final_answer(event.content or "").splitlines():
             print(f"  {WHT}  {ln}{R}")
