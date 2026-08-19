@@ -11,7 +11,7 @@ class AsyncExecutionEngine:
     async def execute(self, task_id, 
                       tool:Tool, 
                       arguments:Dict[str,Any],timeout = 30.0):
-        
+        error_classifier = LLMErrorClassify()
         async def _runner():
             try:
                 if tool.executor_type == "subprocess":
@@ -38,14 +38,14 @@ class AsyncExecutionEngine:
                     )
             except Exception as e:
                 traceback.print_exc()
-                error_type = LLMErrorClassify.classify(str(e))
+                error_type = error_classifier.classify(str(e))
                 return ToolResult(
                     tool_name= tool.name,
                     arguments=arguments,
                     output=None,
                     error = str(e),
                     error_type= error_type,
-                    is_retryable= LLMErrorClassify.is_retryable(error_type)
+                    is_retryable= error_classifier.is_retryable(error_type)
                 )
         
         task = asyncio.create_task(_runner())

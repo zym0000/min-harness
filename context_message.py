@@ -1,5 +1,5 @@
 from token_estimate import TokenEstimate
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 from llm_client import LLMClient
 from enum import Enum, auto
 from task.task_defined import TaskState
@@ -54,11 +54,14 @@ class ContextManager:
                               task_state: Optional[TaskState] = None) -> List[Dict[str, str]]:
 
         if self.strategy == CompressionStrategy.TASK_AWARE and task_state:
-            messages = await self._build_aware(system_prompt, history, llm_client, task_state)
+            messages, protected_head_size = await self._build_aware(
+                system_prompt, history, llm_client, task_state)
         elif self.strategy == CompressionStrategy.WINDOW:
             messages = self._build_window(system_prompt, history)
+            protected_head_size = 1
         else:
             messages = self._build_preserve_all(system_prompt, history)
+            protected_head_size = 1
 
         # 结构归一化：确保唯一 system 且在最前
         messages = self._ensure_single_system_front(messages)
@@ -67,7 +70,7 @@ class ContextManager:
         # 本合并会破坏 tool_call_id 对应关系，届时需对 tool 角色加豁免
         messages = self._merge_consecutive_roles(messages)
         # 截断必须是最后一道守卫（合并后消息变长，先截后合会失去上限保证）
-        messages = self._emergency_truncate(messages)
+        messages = self._emergency_truncate(messages, protected_head_size)
         # 协议守卫：截断可能制造孤儿 tool 消息/无人应答的 tool_calls
         messages = self._repair_tool_protocol(messages)
 
@@ -108,7 +111,7 @@ class ContextManager:
                            system_prompt: str,
                            history: List[Dict[str, str]],
                            llm_client: Optional[LLMClient],
-                           task_state: Optional[TaskState]) -> List[Dict[str, str]]:
+                           task_state: Optional[TaskState]) -> Tuple[List[Dict[str, str]], int]:
 
         recent = self._slice_recent_aligned(history)
         #recent 是需要保留的，那么旧消息就是0->(history - recent)
@@ -170,7 +173,7 @@ class ContextManager:
             })
 
         messages.extend([msg.copy() for msg in recent])
-        return messages
+        return messages, 3 if memory_parts else 1
 
     def _warn_no_llm_once(self) -> None:
         if not self._warned_no_llm:
@@ -376,7 +379,9 @@ class ContextManager:
                         })
         return repaired
 
-    def _emergency_truncate(self, messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def _emergency_truncate(self,
+                             messages: List[Dict[str, str]],
+                             protected_head_size: int = 1) -> List[Dict[str, str]]:
         """
         三级防线：
         1 不超标直接返回（不再有 len<=5 豁免 5 条大消息照样能打爆窗口）；
@@ -384,6 +389,10 @@ class ContextManager:
            保尾数从 4 -> 2 -> 1 递减（至少保 1 条，丢光尾部不如截断它）；
         3 仍超标 -> 对 content 做头尾截断（保 role 结构，system 最后才动），
            下限 40 字符，无进展即停，保证收敛不死循环。
+
+        protected_head_size：head 段消息条数。TASK_AWARE 注入持久记忆时是 3
+        （system + memory_user + assistant 占位），其余策略默认 1（仅 system）。
+        head 段永不丢弃，保尾不够时仍走中间/尾部截断。
         """
 
         budget = self.max_tokens - self.reserve_tokens
@@ -392,13 +401,13 @@ class ContextManager:
 
         #第二级：整条丢弃
         # 这里丢弃 先丢弃最早的信息，如果可以丢弃的信息都丢弃了，还是超了，那么从剩余末尾开始丢弃
-        #末尾的丢弃策略是4-2->1 
+        #末尾的丢弃策略是4-2->1
         keep_tail = 4
         while True:
-            tail_n = max(1, min(keep_tail, len(messages) - 1))
-            head = [messages[0].copy()]
+            tail_n = max(1, min(keep_tail, len(messages) - protected_head_size))
+            head = [m.copy() for m in messages[:protected_head_size]]
             tail = [m.copy() for m in messages[len(messages) - tail_n:]]
-            middle = [m.copy() for m in messages[1:len(messages) - tail_n]]
+            middle = [m.copy() for m in messages[protected_head_size:len(messages) - tail_n]]
 
             current_total = self.token_estimate.estimate_message(messages)
             dropped = 0
@@ -409,8 +418,9 @@ class ContextManager:
 
             result = head + middle + tail
             if dropped:
-                # 告诉模型有上下文被丢弃，不要静默消失
-                result.insert(1, {
+                # 告诉模型有上下文被丢弃，不要静默消失；
+                # 插在 head 之后，保 role 交替不被占位破坏
+                result.insert(protected_head_size, {
                     "role": "user",
                     "content": f"早期上下文因长度限制已丢弃"
                 })
