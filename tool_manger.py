@@ -125,6 +125,56 @@ class ToolCall:
     raw_text:str
     thought:str
 
+# 当 Action Input 不是合法 JSON 时,附加给 LLM 的自纠错提示。
+# 目的: 减少模型在 JSON 拼写错误上的反复挣扎(parse error thrashing)。
+_PARSE_ERROR_HINT = (
+    "提示: Action Input 必须是合法 JSON,格式为 "
+    "Action Input: {\"参数名\": \"参数值\"}。"
+    "常见问题: 1) 键值对之间用 \":\" 而非 \">\" 或 \"=\"; "
+    "2) 字符串值用英文双引号 \" 而不是中文/全角引号; "
+    "3) 字符串值内的 { 或 } 需要转义为 \\{ 或 \\}; "
+    "4) 多行 JSON 时整段放在同一 Action Input: 后。"
+)
+
+
+def _find_balanced_json(text: str, start: int) -> Optional[str]:
+    """
+    从 text[start:] 中找第一个 '{', 用大括号平衡法匹配到对应的 '}'.
+    跳过字符串字面量内的 '{' / '}' 与转义序列。
+    返回包含外层 '{' '}' 的子串;找不到返回 None。
+    """
+    open_idx = text.find('{', start)
+    if open_idx == -1:
+        return None
+
+    depth = 0
+    in_string = False
+    escape = False
+    i = open_idx
+    while i < len(text):
+        ch = text[i]
+        if escape:
+            escape = False
+            i += 1
+            continue
+        if in_string:
+            if ch == '\\':
+                escape = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return text[open_idx:i + 1]
+        i += 1
+    return None
+
+
 class ToolCallParser:
 
     #解析LLM 输出
@@ -144,24 +194,31 @@ class ToolCallParser:
             return None, None
 
         tool_name = action_match.group(1)
-        input_match = re.search(
-            r"Action Input:\s*(\{.*?\})", text, re.DOTALL | re.IGNORECASE
-        )
 
-        if input_match:
-            try:
-                arguments = json.loads(input_match.group(1))
-                return (
-                    ToolCall(
-                        tool_name=tool_name,
-                        arguments=arguments,
-                        raw_text=text,
-                        thought=thought,
-                    ),
-                    None,
-                )
-            except json.JSONDecodeError as e:
-                return None, f"Action Input JSON 解析失败: {e}"
+        anchor = re.search(r"Action Input:", text, re.IGNORECASE)
+        if anchor:
+            json_str = _find_balanced_json(text, anchor.end())
+            if json_str is not None:
+                try:
+                    arguments = json.loads(json_str)
+                    return (
+                        ToolCall(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            raw_text=text,
+                            thought=thought,
+                        ),
+                        None,
+                    )
+                except json.JSONDecodeError as e:
+                    return None, (
+                        f"Action Input JSON 解析失败: {e}。"
+                        f"{_PARSE_ERROR_HINT}"
+                    )
+            return None, (
+                f"Action Input 后未找到配对的 '}}'。"
+                f"{_PARSE_ERROR_HINT}"
+            )
 
         return (
             ToolCall(tool_name=tool_name, arguments={}, raw_text=text, thought=thought),
@@ -280,7 +337,7 @@ class ToolRegistry:
         for param in tool.parameters:
             param_dict = param.to_dict()
             if param_dict.get("required") and param_dict.get("name") not in call.arguments:
-                return f"missing required parame:{param_dict.get("name")}"
+                return f"missing required parameter: {param_dict.get("name")}"
         return None
     
     def describe_tools(self, tools: Optional[List[Tool]] = None) -> str:
