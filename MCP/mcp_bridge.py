@@ -162,5 +162,5 @@ class McpClientPool:
         for bridge in self.mcp_bridge.values():
             await bridge.shutdown()
         
-        self.mcp_bridage.clear()
+        self.mcp_bridge.clear()
         self.mcp_config.clear()
