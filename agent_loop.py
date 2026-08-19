@@ -750,14 +750,15 @@ self._feedback_msg(f"Observation [Tool Error]: 工具 {tool_call.tool_name} 不�
             # 这里 post-hoc yield 出去,让父的 event stream / CLI 能看到子代理完整执行过程
             # 实时错误/心跳已通过 sink 路径推到 _external_events(drain 时已 yield)
             # 这里只补齐 sink 没覆盖的部分(THINKING_*, TOOL_EXECUTION_*, FINAL_ANSWER 等)
-            replayed = (result.data or {}).get("events") if result.data else None
-            if replayed:
-                for sub_event in replayed:
-                    # 不重 yield sub_agent 工具自己的 COMPLETED(就是上面那条),
-                    # 避免重复。其它子代理事件都 forward
-                    if sub_event.tool_name == "sub_agent":
-                        continue
-                    yield sub_event
+            # 这里注释放开，会在CLI 中详细显示sub agent 整个过程，如果要查BUG，可以放开，这里先注释
+            # replayed = (result.data or {}).get("events") if result.data else None
+            # if replayed:
+            #     for sub_event in replayed:
+            #         # 不重 yield sub_agent 工具自己的 COMPLETED(就是上面那条),
+            #         # 避免重复。其它子代理事件都 forward
+            #         if sub_event.tool_name == "sub_agent":
+            #             continue
+            #         yield sub_event
 
             # 状态转移（仅"转移被拒绝"才跳过 Observation）
             if not result.is_error and hasattr(self.tool_registry, "transit_task_skill_state"):
