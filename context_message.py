@@ -18,10 +18,7 @@ class CompressionStrategy(Enum):
 class ContextManager:
 
     # 增量提取触发阈值的默认值。
-    # 提到 60 是 cache 命中率优化:DB 变化频率从 ~1/10 步降到 ~1/30 步,
-    # OpenAI prefix cache 的失效也跟着减半。memory 新鲜度略降(从 20 消息
-    # 间隔变成 60),超长任务 (>100 步) 可调回 30 或 40。短任务无感。
-    MIN_NEW_MESSAGES_FOR_EXTRACT = 60
+    MIN_NEW_MESSAGES_FOR_EXTRACT = 20
 
     def __init__(self,
                  max_tokens: int = 8000,       # LLM 窗口大小
@@ -158,18 +155,21 @@ class ContextManager:
             memory_parts.append(f"[memory]\n{task_state.memory_segment}")
 
         if memory_parts:
+            # 持久记忆状态走 user 消息 + assistant 占位的目的是让 system + 占位锚定 prefix
             memory_content = (
-                "[Persistent task context — not a request, "
-                "do not respond to it directly]\n\n"
+                "[Persistent task memory — system-managed background "
+                "state (task goal, key facts, working memory) auto-injected "
+                "for context continuity. This is NOT a user message and the "
+                "next real user request will follow. Continue working on the "
+                "task as you would for any normal turn.]\n\n"
                 + "\n\n".join(memory_parts)
             )
             messages.append({"role": "user", "content": memory_content})
             # assistant 占位:user 跟 recent[0] 都是 user role,
             # 不隔开会被 _merge_consecutive_roles 合并,把 持久记忆状态 拖进 recent 变化区
-            # 占位字符串固定,字节稳定,本身能稳定命中 cache
             messages.append({
                 "role": "assistant",
-                "content": "[Context acknowledged]",
+                "content": "Background context noted. Proceeding with the task.",
             })
 
         messages.extend([msg.copy() for msg in recent])
@@ -417,13 +417,13 @@ class ContextManager:
                 current_total -= self.token_estimate.estimate(discarded.get("content", "")) + 4
 
             result = head + middle + tail
-            if dropped:
-                # 告诉模型有上下文被丢弃，不要静默消失；
-                # 插在 head 之后，保 role 交替不被占位破坏
-                result.insert(protected_head_size, {
-                    "role": "user",
-                    "content": f"早期上下文因长度限制已丢弃"
-                })
+            # if dropped:
+            #     # 告诉模型有上下文被丢弃，不要静默消失；
+            #     # 插在 head 之后，保 role 交替不被占位破坏
+            #     result.insert(protected_head_size, {
+            #         "role": "user",
+            #         "content": f"早期上下文因长度限制已丢弃"
+            #     })
 
             if self.token_estimate.estimate_message(result) <= budget or keep_tail <= 1:
                 break

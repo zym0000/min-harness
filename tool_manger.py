@@ -299,7 +299,7 @@ class ToolResult:
 
     @property
     def is_error(self):
-        return self.error if not None else ""
+        return self.error if self.error is not None else ""
     
     #这里返回的只是个人采用的格式，这里可以自己定义返回格式类型
     def to_text(self):

@@ -3,9 +3,6 @@ from typing import Dict,List
 import numpy as np
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-#这个sys.path.insert是因为我本地python 库因为window 长度显示，所以把库安装指定位置
-import sys
-sys.path.insert(0, r'C:\\Users\\zym\\AppData\\Local\\pylibs')
 import torch
 from transformers import AutoTokenizer, AutoModel
 

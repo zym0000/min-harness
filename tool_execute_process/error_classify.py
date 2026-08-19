@@ -1,18 +1,13 @@
-
 from enum import Enum, auto
 from typing import Optional
 import re
+import logging
 import os
 os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
-import sys
-sys.path.insert(0, r'C:\\Users\\zym\\AppData\\Local\\pylibs')
-import torch
-from transformers import AutoModel,AutoTokenizer
-import numpy as np
-import logging
+# import sys
+# sys.path.insert(0, r'C:\\Users\\zym\\AppData\\Local\\pylibs')
 
 _LOG = logging.getLogger("harness.error_classify")
-
 
 class ToolErrorType(Enum):
     """工具错误类型分类"""
