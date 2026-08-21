@@ -17,32 +17,39 @@ class CompressionStrategy(Enum):
 
 class ContextManager:
 
-    # 增量提取触发阈值的默认值。
-    MIN_NEW_MESSAGES_FOR_EXTRACT = 20
+    # 记忆自压缩：memory_segment 超过此 token 数时,下次提取切到 compact prompt
+    MEMORY_SEGMENT_COMPACTION_THRESHOLD = 2000
+    # 压缩目标上限（prompt 要求 LLM 压到多少 token 以内）
+    MEMORY_SEGMENT_COMPACTED_TARGET = 1500
 
     def __init__(self,
                  max_tokens: int = 8000,       # LLM 窗口大小
                  reserve_tokens: int = 2000,   # 预留给LLM生成回复的token 大小
-                 keep_recent_turns: int = 3,   # 保留最近的轮数
+                 recent_messages_token: int = 4000,
                  strategy: CompressionStrategy = CompressionStrategy.TASK_AWARE,
-                 min_new_messages_for_extract: int = MIN_NEW_MESSAGES_FOR_EXTRACT,
+                 min_old_token_for_extract: int = 1500,
                  extract_timeout: float = 120.0):
 
         self.max_tokens = max_tokens
         self.reserve_tokens = reserve_tokens
-        # 注意单位：内部一律按"消息条数"计（1 轮 = user+assistant 2 条）
-        self.recent_messages = keep_recent_turns * 2
+
+        self.recent_messages_floor = 4 #至少保留4轮
+        self.recent_messages_ceiling  = 30 #最多保留15轮
         self.token_estimate = TokenEstimate()
         self.strategy = strategy
         #提取阈值与超时可配置
-        self.min_new_messages_for_extract = min_new_messages_for_extract
+        self.recent_token_budget = recent_messages_token
+        self.min_old_token_for_extract = min_old_token_for_extract
         self.extract_timeout = extract_timeout
         self._warned_no_llm = False
 
-    # 兼容旧引用：self.recent_turns 历史上存的是"条数"，保留别名避免外部依赖破裂
     @property
     def recent_turns(self) -> int:
-        return self.recent_messages
+        return self.recent_messages_ceiling
+
+    @property
+    def recent_messages(self) -> int:
+        return self.recent_messages_ceiling
 
     async def prepare_message(self,
                               system_prompt: str,
@@ -65,7 +72,7 @@ class ContextManager:
         # 确保角色是交替进行的 system -> user -> assistant -> user...
         # 注意：若未来切换 OpenAI 原生 tool calling（role="tool"），
         # 本合并会破坏 tool_call_id 对应关系，届时需对 tool 角色加豁免
-        messages = self._merge_consecutive_roles(messages)
+        messages = self._batch_consecutive_users(messages)
         # 截断必须是最后一道守卫（合并后消息变长，先截后合会失去上限保证）
         messages = self._emergency_truncate(messages, protected_head_size)
         # 协议守卫：截断可能制造孤儿 tool 消息/无人应答的 tool_calls
@@ -78,31 +85,104 @@ class ContextManager:
         return [{"role": "system", "content": system_prompt}] + [msg.copy() for msg in history]
 
     def _build_window(self, system_prompt: str, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        recent = self._slice_recent_aligned(history)
+        recent = self._slice_recent_token(history)
         return [{"role": "system", "content": system_prompt}] + [msg.copy() for msg in recent]
 
-    def _slice_recent_aligned(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    def _slice_recent_token(self, history: List[Dict[str, str]]) -> List[Dict[str, str]]:
         """
-        取最近 recent_messages 条，并对齐"轮边界"：
-        若切片开头是孤儿消息（assistant 的 Action / 半截 Observation），
-        向前扩展（最多多带 4 条）直到一个真实用户输入——
-        宁可窗口略大，也不给模型看没有前因的半截上下文。
+        从最新开始累计token,不超过recent_token_budget
+        并对齐 User 边界，附带条数硬上下限保护。
         """
-        if len(history) <= self.recent_messages:
-            return list(history)
-        start = len(history) - self.recent_messages
+        if not history:
+            return []
+
+        result:List[Dict[str, str]] = []
+        total_token = 0
+        budget = self.recent_token_budget
+        for msg in reversed(history):
+            # 口径与 estimate_message 单条对齐:加 4 tokens 当 role overhead
+            msg_token = self.token_estimate.estimate(msg.get("content", "")) + 4
+
+            if ((total_token + msg_token > budget and result) or 
+                (len(result) >= self.recent_messages_ceiling)):
+                break
+            #这里为什么向前插入，原因是我们遍历是从最后开始的
+            result.insert(0,msg)
+            total_token += msg_token
+
+        start = len(history) - len(result)
+        #向前回溯4条消息，一般llm 在 1~3条，4条能满足
         min_start = max(0, start - 4)
         while start > min_start and self._is_orphan(history[start]):
             start -= 1
-        return history[start:]
+            result.insert(0, history[start])
+
+        while len(result) < self.recent_messages_floor and start > 0:
+            start -= 1
+            result.insert(0,history[start])
+        
+        return result
 
     @staticmethod
     def _is_orphan(msg: Dict[str, str]) -> bool:
         content = msg.get("content", "")
         if msg.get("role") != "user":
             return True
+        if content.startswith("[SYSTEM NOTICE:"):
+            return False
         return content.startswith(
             ("Observation", "[Parse Error]", "[Approval", "[SYSTEM", "[System"))
+
+    @staticmethod
+    def _batch_consecutive_users(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+        if not messages:
+            return messages
+
+        result = []
+        i = 0
+        while i < len(messages):
+            msg = messages[i]
+            
+            # 防御：提取 content 时做标准化
+            def get_content_safe(m):
+                raw = m.get("content")
+                if raw is None:
+                    return "[空消息]"
+                if isinstance(raw, str):
+                    return raw
+                # 如果是多模态列表（OpenAI 格式），尝试提取文本部分，否则序列化
+                if isinstance(raw, list):
+                    texts = [part.get("text", "") for part in raw if isinstance(part, dict) and "text" in part]
+                    return "\n".join(texts) if texts else "[非文本内容]"
+                return str(raw)
+
+            # 检测连续的 user 消息（排除工具注入的虚拟 user）
+            if msg["role"] == "user" and "tool_calls" not in msg:
+                batch = [msg]
+                j = i + 1
+                while j < len(messages) and messages[j]["role"] == "user" and "tool_calls" not in messages[j]:
+                    batch.append(messages[j])
+                    j += 1
+                
+                if len(batch) > 1:
+                    content_parts = [
+                        f"[SYSTEM NOTICE: 用户连续发送了 {len(batch)} 条独立消息。"
+                        f"请严格按编号顺序理解，注意后续消息可能包含对前述消息的修正、补充或撤销。]"
+                    ]
+                    for idx, m in enumerate(batch, 1):
+                        content_parts.append(f"{idx}. {get_content_safe(m)}")
+                    
+                    result.append({
+                        "role": "user", 
+                        "content": "\n".join(content_parts)
+                    })
+                else:
+                    result.append(msg.copy())
+                i = j
+            else:
+                result.append(msg.copy())
+                i += 1
+        return result
 
     async def _build_aware(self,
                            system_prompt: str,
@@ -110,34 +190,46 @@ class ContextManager:
                            llm_client: Optional[LLMClient],
                            task_state: Optional[TaskState]) -> Tuple[List[Dict[str, str]], int]:
 
-        recent = self._slice_recent_aligned(history)
+        recent = self._slice_recent_token(history)
+        cut = len(history) - len(recent)
+
         #recent 是需要保留的，那么旧消息就是0->(history - recent)
-        old = history[:len(history) - len(recent)] if len(history) > len(recent) else []
+        old = history[:cut] if cut > 0 else []
 
         if old and task_state:
             if llm_client is None:
                 self._warn_no_llm_once()
+            # 这里是增量提取，memory_cursor 记录的是上次提取最后条数
+            cursor = getattr(task_state, "memory_cursor", 0)
+
+            if cut > cursor:
+                pending = history[cursor:cut]
             else:
-                # 这里是增量提取，memory_cursor 记录的是上次提取最后条数
-                cursor = getattr(task_state, "memory_cursor", 0)
-                cut = len(history) - len(recent)
-                new_old = history[cursor:cut]
-                # 连续失败指数退避（×2^failures，上限 8 倍），
-                # 避免 LLM 持续故障时每一步都白调一次
-                failures = getattr(task_state, "_extract_failures", 0)
-                #这里不是每次都提取，只要满足最小的提取条数才会触发
-                threshold = self.min_new_messages_for_extract * (2 ** min(failures, 3))
-                if len(new_old) >= threshold:
-                    #更新提取信息
-                    new_memory = await self._extract_task_memory(new_old, llm_client, task_state)
+                pending = []
+
+            if pending:
+                pending_tokens = self.token_estimate.estimate_message(pending)
+
+                #绝对 token + 相对 token
+                should_extract = (
+                    pending_tokens >= self.min_old_token_for_extract
+                    or pending_tokens >= self.recent_token_budget * 0.4
+                )
+                if should_extract:
+                    new_memory = await self._extract_task_memory(pending, llm_client, task_state)
                     if new_memory:
                         task_state.memory_segment = new_memory
-                        task_state.memory_cursor = cut   # 提取成功才推进，失败下步重试
-                        task_state._extract_failures = 0
-                        _LOG.info("增量记忆提取完成：游标 %d->%d，%d 条消息",
-                                  cursor, cut, len(new_old))
-                    else:
-                        task_state._extract_failures = failures + 1
+                        task_state.memory_cursor = cut
+                        user_cnt_old = getattr(task_state, "_last_extract_user_count", 0)
+                        user_msgs_in_pending = sum(
+                            1 for m in pending if m.get("role") == "user"
+                        )
+                        user_cnt_new = user_cnt_old + user_msgs_in_pending
+                        task_state._last_extract_user_count = user_cnt_new
+                        _LOG.info("增量提取 step=%d cursor %d→%d (%d条, ~%d tokens, user_cnt %d→%d)",
+                                    getattr(task_state, "current_step", 0),
+                                    cursor, cut, len(pending), pending_tokens,
+                                    user_cnt_old, user_cnt_new)
 
         # 持久记忆状态 三段 (task_summary / key_facts / memory_segment) 挪出 system,
         # 拼成一条 user 消息 + 一条 assistant 占位,目的是让 SS 永远稳定:
@@ -153,7 +245,14 @@ class ContextManager:
             memory_parts.append(f"[key facts]\n{facts_text}")
         if task_state and task_state.memory_segment:
             memory_parts.append(f"[memory]\n{task_state.memory_segment}")
-
+            
+        if getattr(task_state, "_facts_evicted_total", 0) > 0:
+            memory_parts.append(
+                f"[Facts note] 历史累计已驱逐 {task_state._facts_evicted_total} 条较早事实"
+                f"(当前 key_facts 上限 50 条)."
+                f"被驱逐的内容仅在 memory_segment 中可能保留,"
+                f"如需引用请优先依据 memory_segment."
+            )
         if memory_parts:
             # 持久记忆状态走 user 消息 + assistant 占位的目的是让 system + 占位锚定 prefix
             memory_content = (
@@ -192,9 +291,9 @@ class ContextManager:
             role = msg.get("role", "UNKNOWN")
             content = msg.get("content", "")
 
-            # 采用 头...尾 的提取方式，避免中间截断导致关键语义完全丢失
-            if len(content) > 500:
-                content = content[:250] + "\n...[Middle content omitted]...\n" + content[-250:]
+            # 这里防止LLM 提取窗口爆炸，但是对于现在模型上下文窗口1M来说,不需要进行截断进行判断，截断反而在压缩的时候，会造成很多必要消息丢弃
+            # if len(content) > 500:
+            #     content = content[:250] + "\n...[Middle content omitted]...\n" + content[-250:]
 
             history_text += f"{role}:{content}\n"
 
@@ -203,12 +302,26 @@ class ContextManager:
 
         # prompt 与解析端显式对齐——四项标签、禁代码块、禁解释、无噪音尾行
         prev_memory = task_state.memory_segment or "(无)"
+        prev_memory_tokens = self.token_estimate.estimate(prev_memory)
+        compaction_mode = prev_memory_tokens > self.MEMORY_SEGMENT_COMPACTION_THRESHOLD
+
+        if compaction_mode:
+            size_limit = f"压缩到约 {self.MEMORY_SEGMENT_COMPACTED_TARGET} tokens 以内"
+            compaction_directive = (
+                f"\n重要:已有记忆已膨胀至约 {prev_memory_tokens} tokens,"
+                f"本次输出必须{size_limit}。"
+                f"丢弃已彻底完成的步骤细节,仅保留:任务目标、未完成项、关键发现。\n"
+            )
+        else:
+            size_limit = "800字以内"
+            compaction_directive = ""
+
         prompt = textwrap.dedent(f"""\
-            请综合"已有记忆"与"本次新增对话"，输出"截至当前的完整任务记忆"（800字以内）。
+            请综合"已有记忆"与"本次新增对话"，输出"截至当前的完整任务记忆"({size_limit})。
             - 已有记忆中仍然成立的内容必须保留
             - 新增对话里的关键信息要并入对应分类
             - 已被新对话覆盖或推翻的旧信息可以删除
-            - 严格按以下四项输出，每项一个标签；不要输出其他内容，不要使用代码块
+            - 严格按以下三项输出，每项一个标签；不要输出其他内容，不要使用代码块{compaction_directive}
 
             <previous_memory>
             {prev_memory}
@@ -228,7 +341,6 @@ class ContextManager:
 
             任务目标:[一句话概括用户最终想达成什么，如果已有则保持一致]
             已完成:[已完成的关键步骤]
-            待处理:[还需要做的]
             关键发现:[重要事实、数据、决策，每条用 - 开头]
             """)
         try:
@@ -254,6 +366,11 @@ class ContextManager:
             _LOG.warning("任务记忆提取返回空响应（本次跳过，游标不推进）")
             return None
         self._parse_and_update_state(response_text, task_state)
+        if compaction_mode:
+            task_state._compaction_count += 1
+            _LOG.info("记忆自压缩触发(prev=%d tokens → target<=%d tokens, 第 %d 次)",
+                      prev_memory_tokens, self.MEMORY_SEGMENT_COMPACTED_TARGET,
+                      task_state._compaction_count)
         return response_text
 
     def _parse_and_update_state(self, memory_text: str, task_state: TaskState):
@@ -285,11 +402,16 @@ class ContextManager:
                 continue
             m = re.match(r"^[-•*\d.、]+\s*(.+)$", line)
             fact = (m.group(1) if m else line).strip()
-            if len(fact) > 2 and fact not in task_state.key_facts:
-                task_state.key_facts.append(fact)
-                # 防止存储爆炸
-                if len(task_state.key_facts) > 20:
-                    task_state.key_facts.pop(0)
+            # 大小写不敏感去重：建索引时统一 fold,保留首次出现的原拼写
+            if len(fact) > 2:
+                key_folded = fact.casefold()
+                existing_keys = {f.casefold() for f in task_state.key_facts}
+                if key_folded not in existing_keys:
+                    task_state.key_facts.append(fact)
+                    # 防止存储爆炸——编码任务的关键事实(API名/路径/版本)很容易超 20
+                    if len(task_state.key_facts) > 50:
+                        task_state.key_facts.pop(0)
+                        task_state._facts_evicted_total += 1
         #四项标签一个都没匹配上 -> 格式不符，留痕（原文仍入 memory_segment）
         if matched_sections == 0:
             _LOG.warning("记忆提取输出格式不符（未匹配到任何标签）：%.80s...", memory_text)
@@ -380,83 +502,60 @@ class ContextManager:
         return repaired
 
     def _emergency_truncate(self,
-                             messages: List[Dict[str, str]],
-                             protected_head_size: int = 1) -> List[Dict[str, str]]:
-        """
-        三级防线：
-        1 不超标直接返回（不再有 len<=5 豁免 5 条大消息照样能打爆窗口）；
-        2 整条丢弃最旧的 middle 并插入占位标记；若保尾 4 条本身就超标，
-           保尾数从 4 -> 2 -> 1 递减（至少保 1 条，丢光尾部不如截断它）；
-        3 仍超标 -> 对 content 做头尾截断（保 role 结构，system 最后才动），
-           下限 40 字符，无进展即停，保证收敛不死循环。
-
-        protected_head_size：head 段消息条数。TASK_AWARE 注入持久记忆时是 3
-        （system + memory_user + assistant 占位），其余策略默认 1（仅 system）。
-        head 段永不丢弃，保尾不够时仍走中间/尾部截断。
-        """
-
+                            messages: List[Dict[str, str]],
+                            protected_head_size: int = 1) -> List[Dict[str, str]]:
         budget = self.max_tokens - self.reserve_tokens
         if self.token_estimate.estimate_message(messages) <= budget:
             return messages
 
-        #第二级：整条丢弃
-        # 这里丢弃 先丢弃最早的信息，如果可以丢弃的信息都丢弃了，还是超了，那么从剩余末尾开始丢弃
-        #末尾的丢弃策略是4-2->1
+        # 第二级：整条丢弃最旧的 middle 消息
         keep_tail = 4
         while True:
-            tail_n = max(1, min(keep_tail, len(messages) - protected_head_size))
-            head = [m.copy() for m in messages[:protected_head_size]]
-            tail = [m.copy() for m in messages[len(messages) - tail_n:]]
-            middle = [m.copy() for m in messages[protected_head_size:len(messages) - tail_n]]
+            non_head_count = max(0, len(messages) - protected_head_size)
+            if non_head_count == 0:
+                # 没有可丢弃的中间消息，直接进入内容截断
+                result = [m.copy() for m in messages]
+                break
 
-            current_total = self.token_estimate.estimate_message(messages)
-            dropped = 0
+            tail_n = min(keep_tail, non_head_count)
+            head = [m.copy() for m in messages[:protected_head_size]]
+            tail = [m.copy() for m in messages[-tail_n:]] if tail_n > 0 else []
+            middle = [m.copy() for m in messages[protected_head_size:len(messages)-tail_n]]
+
+            # 基于当前结果计算 token，确保丢弃时计数准确
+            # 这里为什么从 最早开始丢弃，原因是，在增量提取的时候，最早的消息已经被摘要提取了
+            current_total = self.token_estimate.estimate_message(head + middle + tail)
             while middle and current_total > budget:
                 discarded = middle.pop(0)
-                dropped += 1
                 current_total -= self.token_estimate.estimate(discarded.get("content", "")) + 4
 
             result = head + middle + tail
-            # if dropped:
-            #     # 告诉模型有上下文被丢弃，不要静默消失；
-            #     # 插在 head 之后，保 role 交替不被占位破坏
-            #     result.insert(protected_head_size, {
-            #         "role": "user",
-            #         "content": f"早期上下文因长度限制已丢弃"
-            #     })
-
             if self.token_estimate.estimate_message(result) <= budget or keep_tail <= 1:
                 break
             keep_tail //= 2
 
-        #如果丢弃消息还是超了,截断 content
-        #这里要说明下，如果走到这里，那么整个记忆系统里面 system +  最终一条信息
+        # 第三级：对 content 做头尾截断
         guard = 0
         while self.token_estimate.estimate_message(result) > budget and guard < 12:
             guard += 1
-            # 优先截非 system 的最长消息；没有其它消息时才动 system
             candidates = range(1, len(result)) if len(result) > 1 else range(len(result))
             longest_i = max(candidates, key=lambda i: len(result[i].get("content", "")))
             content = result[longest_i].get("content", "")
-            #小于40 不截取
             if len(content) <= 40:
                 break
-            #这里是截断一半，前面留1/4，后面留1/4
             quarter = max(20, len(content) // 4)
             new_content = content[:quarter] + "\n...[truncated]...\n" + content[-quarter:]
             if len(new_content) >= len(content):
                 break
             result[longest_i] = {**result[longest_i], "content": new_content}
 
-        # 硬收缩
+        # 硬收缩（最后手段）
         est_now = self.token_estimate.estimate_message(result)
         if est_now > budget:
             _LOG.warning("紧急截断三级后仍超标（est=%d > budget=%d），执行硬收缩",
-                         est_now, budget)
-            #这里是等比例收缩，*0.9是为了保留10% 估算误差
+                        est_now, budget)
             ratio = max(0.05, budget / est_now * 0.9)
             shrunk = []
-            #对所有消息进行比例压缩
             for m in result:
                 c = m.get("content", "")
                 keep = max(20, int(len(c) * ratio))
@@ -466,7 +565,6 @@ class ContextManager:
                 shrunk.append({**m, "content": c})
             result = shrunk
 
-            #如果还是超了，那么找打最长消息，进行对半砍
             guard = 0
             while self.token_estimate.estimate_message(result) > budget and guard < 50:
                 guard += 1
@@ -475,15 +573,13 @@ class ContextManager:
                 c = result[i].get("content", "")
                 if len(c) <= 20:
                     _LOG.error("全部消息已到硬下限仍超预算（est=%d > budget=%d），"
-                               "token 估算可能失真，放行", 
-                               self.token_estimate.estimate_message(result), budget)
+                            "token 估算可能失真，放行", 
+                            self.token_estimate.estimate_message(result), budget)
                     break
-
-                #对半砍实现
                 keep = max(20, len(c) // 2)
                 half = max(10, keep // 2)
                 new_c = c[:half] + "…" + c[-half:]
-                if len(new_c) >= len(c):            # 无进展兜底：直接砍到下限
+                if len(new_c) >= len(c):
                     new_c = c[:10] + "…" + c[-10:]
                 result[i] = {**result[i], "content": new_c}
 
