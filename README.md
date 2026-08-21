@@ -1,4 +1,4 @@
-# MiniMax Harness
+# Min Harness
 
 ![show](./image/show.png)
 

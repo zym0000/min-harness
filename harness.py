@@ -29,6 +29,8 @@ class HarnessConfig:
     use_embeddings: bool = False             # 意图识别用向量模型（需下载权重）
     context_max_tokens: int = 12000           # 上下文窗口预算
     context_reserve_tokens: int = 2000       # 给回答预留的 token
+    recent_messages_token: int = 4000       # recent 区 token 水位线
+    min_old_token_for_extract: int = 1500   # 旧区累计触发提取的 token 阈值
     task_max_history: int = 100              # 单任务消息历史上限
     store_path: Optional[str] = None         # SQLite 检查点路径；None=纯内存
     #sub agent
@@ -69,7 +71,9 @@ class Harness:
         self.semaphore = asyncio.Semaphore(cfg.max_concurrent)
         self.context_manager = context_manager or ContextManager(
             max_tokens=cfg.context_max_tokens,
-            reserve_tokens=cfg.context_reserve_tokens)
+            reserve_tokens=cfg.context_reserve_tokens,
+            recent_messages_token=cfg.recent_messages_token,
+            min_old_token_for_extract=cfg.min_old_token_for_extract)
         self.approval_gates: Dict[str, ApprovalGate] = {}
         self.watch_dog = AntioscillationWatchDog() if cfg.enable_watchdog else None
 
@@ -342,24 +346,18 @@ class Harness:
     #prompt
 
     def _build_system_prompt(self, filtered_tools: List[Tool]) -> str:
-        tools_desc = "\n\n".join([t.to_react_description() for t in filtered_tools])
-        return f"""你是一个智能助手，可以使用以下工具来完成用户的任务。
+        # 走 OpenAI 原生 tools 协议:工具的 schema 通过 API tools 参数传入,
+        # 不再让 LLM 在文本里手写 Thought/Action/Action Input,也不嵌入工具描述。
+        # 这样 LLM 直接返回结构化 tool_calls,parser 路径不再误判"final answer"。
+        tool_names = ", ".join(t.name for t in filtered_tools)
+        return f"""你是一个智能助手,可以使用工具帮助用户完成任务。
 
-可用工具：
-{tools_desc}
+工作方式:
+- 任务需要信息或操作时,直接调用工具(工具的 schema 已经在 tools 参数中提供)
+- 一次只能调用一个工具,需要多个就多轮调用
+- 工具调用失败时,根据错误信息调整参数或换工具重试
+- 任务完成后,用自然语言简洁地总结结果给用户
+- 不需要工具的问题(如闲聊、解释概念、问答),直接回答即可
 
----
-
-输出规则：
-1. 如果需要使用工具，请严格按以下格式输出：
-
-Thought: 你的思考过程（为什么需要这个工具）
-Action: 工具名
-Action Input: {{"参数名": "参数值"}}
-
-2. 如果不需要工具，直接以 "Final Answer: ..." 开头回答用户问题。
-
-3. 工具执行结果会以 Observation: 的形式返回给你，请基于结果给出最终回答。
-
-4. 如果工具执行失败，请分析错误原因并尝试修正参数后重新调用。
+当前任务可用工具:{tool_names}
 """

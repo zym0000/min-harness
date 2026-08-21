@@ -426,12 +426,14 @@ def _build_child_system_prompt(
     子代理 system_prompt。
 
     强调:
-    - 没有父任务历史；
+    - 没有父任务历史;
     - 只看 prompt;
-    - 使用父任务工具集；
-    - ReAct 输出格式。
+    - 使用父任务工具集;
+    - 与主代理一致,走 OpenAI 原生 tools 协议(工具 schema 通过 API 传入,
+      system prompt 不嵌入 ReAct 文本格式,让 LLM 直接返回结构化 tool_calls)。
     """
-    tools_desc = "\n\n".join(_describe_tool(t) for t in parent_filtered_tools)
+    # 与 harness._build_system_prompt 对齐:只列工具名,不嵌入工具描述。
+    tool_names = ", ".join(t.name for t in parent_filtered_tools)
 
     skill_patch_func = getattr(harness.registry, "get_discovery_prompt_patch", None)
     skill_patch = ""
@@ -442,32 +444,23 @@ def _build_child_system_prompt(
             logger.exception("registry.get_discovery_prompt_patch failed")
             skill_patch = ""
 
-    return f"""你是一个子代理，正在执行父代理委派的一个独立子任务。
+    return f"""你是一个子代理,正在执行父代理委派的一个独立子任务。
 你没有父任务的对话历史——只看下面的 prompt 作为你的目标。
+完成后,你的最终回答会作为结果返回给父代理。
 
 [Sub-task]
 {prompt}
 
 ---
 
-可用工具：
-{tools_desc}
+工作方式:
+- 任务需要信息或操作时,直接调用工具(工具的 schema 已经在 tools 参数中提供)
+- 一次只能调用一个工具,需要多个就多轮调用
+- 工具调用失败时,根据错误信息调整参数或换工具重试
+- 不需要工具的问题(如闲聊、解释概念、问答),直接回答即可
+
+当前任务可用工具:{tool_names}
 {skill_patch}
-
----
-
-输出规则:
-1. 如果需要使用工具，请严格按以下格式输出:
-
-Thought: 你的思考过程(为什么需要这个工具)
-Action: 工具名
-Action Input: {{"参数名": "参数值"}}
-
-2. 如果不需要工具，直接以 "Final Answer: ..." 开头回答。
-
-3. 工具执行结果会以 Observation: 的形式返回。
-
-4. 完成后，你的整段最终回答会作为结果返回给父代理。
 """
 
 def make_sub_agent_tool(harness: "Harness") -> Tool:

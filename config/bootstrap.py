@@ -83,6 +83,9 @@ async def bootstrap(
         enable_watchdog=True,
         context_max_tokens=100000,
         context_reserve_tokens=10000,
+        # budget=90k,recent 占 40% = 36k,触发阈值 = recent × 40% = 14.4k
+        recent_messages_token=36000,
+        min_old_token_for_extract=14400,
         store_path=store_path,
     )
 

@@ -95,7 +95,7 @@ class TaskManager:
             system_prompt = state.system_prompt
             history_message = list(state.messages)          # 快照
 
-        # prepare_message 可能触发记忆提取（写 task_state 的记忆字段），
+        # prepare_message 可能触发记忆提取（写 task_state 的记忆字段）,
         # 在锁外执行（LLM 调用耗时长，持锁会阻塞同任务的其他写入）
         messages = await context_message.prepare_message(
             system_prompt=system_prompt,

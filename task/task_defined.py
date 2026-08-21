@@ -39,6 +39,9 @@ class TaskState:
     key_facts: List[str] = field(default_factory=list)  # 关键事实和发现
     memory_segment: Optional[str] = None                # 增量结构化记忆
     memory_cursor: int = 0                              # 已总结到 messages 的第几条
+    _last_extract_user_count: int = 0                  # 上次抽取覆盖到的 user 消息数(增量提取游标)
+    _compaction_count: int = 0                          # 记忆自压缩次数（可观测性）
+    _facts_evicted_total: int = 0                       # key_facts 历史累计驱逐条数(仅观察)
 
     def to_checkpoint(self) -> Dict:
         """全量快照"""
@@ -57,6 +60,9 @@ class TaskState:
             "key_facts": list(self.key_facts),
             "memory_segment": self.memory_segment,
             "memory_cursor": self.memory_cursor,
+            "_last_extract_user_count": self._last_extract_user_count,
+            "_compaction_count": self._compaction_count,
+            "_facts_evicted_total": self._facts_evicted_total,
         }
 
     @classmethod
@@ -76,6 +82,9 @@ class TaskState:
             key_facts=list(data.get("key_facts", [])),
             memory_segment=data.get("memory_segment"),
             memory_cursor=data.get("memory_cursor", 0),
+            _last_extract_user_count=data.get("_last_extract_user_count", 0),
+            _compaction_count=data.get("_compaction_count", 0),
+            _facts_evicted_total=data.get("_facts_evicted_total", 0),
         )
         # 进程重启后，RUNNING/PAUSED 执行者已经没了，
         # 统一降为 PAUSED，等 continue_task 重新激活
